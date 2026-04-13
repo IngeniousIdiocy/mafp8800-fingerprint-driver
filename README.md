@@ -35,7 +35,7 @@ This project provides a **fully open-source replacement** where every line of co
 |--------|--------|---------|-----------|--------|
 | GPD MicroPC 2 | Microarray MAFP8800 (FP36) | 0x24 | SPI (ACPI HID `MAFP8800`) | Working |
 
-The community binary also supports a second variant (FP88, chip ID 0x58) with separate `mafp_sensor88_*` functions, suggesting a different image geometry. This driver only supports the FP36 variant. If you have hardware with chip ID 0x58, please open an issue.
+The community binary also supports a second variant (FP88, chip ID 0x58) with separate `mafp_sensor88_*` functions, suggesting a different image geometry. This driver only supports the FP36 variant. If you have FP88 hardware and want to add support, PRs are welcome.
 
 ## Building and installing
 

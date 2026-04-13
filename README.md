@@ -8,7 +8,7 @@ The installable driver lives in a [libfprint fork](https://github.com/IngeniousI
 
 The MAFP8800 has **zero official Linux support** -- no mainline kernel driver, no libfprint driver, nothing on GitHub.
 
-The only Linux driver that exists is a **closed-source binary** distributed informally on the [GPD Devices Discord](https://discord.com/invite/FzEsh3k). It ships as a pre-compiled `libfprint-2.so` (no source code) packaged for Ubuntu 24.10 only.
+The only Linux driver that exists is a **closed-source binary** distributed informally on the [GPD Devices Discord](https://discord.com/invite/FzEsh3k). It ships as pre-compiled `libfprint-2.so` binaries (no source code) packaged for various distros.
 
 **This is a security problem.** A fingerprint driver has privileged access to biometric data and runs as root. Distributing it as an unverifiable binary through Discord -- with no code review, no reproducible build, no signature -- means users must blindly trust that the binary is what it claims to be.
 

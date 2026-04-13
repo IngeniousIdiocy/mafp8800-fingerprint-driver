@@ -17,7 +17,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* For detailed documentation (protocol, matching algorithm, project history):
+/*
+ * This driver subclasses FpDevice directly instead of FpImageDevice because
+ * the sensor's 36x160 pixel image at ~200 DPI is far too low-resolution for
+ * libfprint's NBIS minutiae extraction (mindtct typically finds 0-5 minutiae,
+ * insufficient for bozorth3 matching). Instead, the driver implements its own
+ * SIFT-WHT binary descriptor matching pipeline tuned for this sensor geometry.
+ *
+ * For detailed documentation (protocol, matching algorithm, project history):
  * https://github.com/IngeniousIdiocy/mafp8800-fingerprint-driver
  */
 
@@ -33,10 +40,7 @@
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
 
-
-/* ─── constants (from community driver binary decode) ────────────── */
-
-/* Image geometry: 160 rows × 37 pixels, 74 bytes/row (2 hdr + 72 pixel) */
+/* Image geometry: 160 rows x 37 pixels, 74 bytes/row (2 hdr + 72 pixel) */
 #define MAFP_ROWS             160
 #define MAFP_COLS             37
 #define MAFP_ROW_BYTES        74       /* 0x4A */
@@ -52,15 +56,13 @@
 /* Chip ID */
 #define MAFP_CHIPID_FP36      0x24
 
-/* Detection thresholds (from community binary) */
+/* Detection thresholds */
 #define MAFP_DETECT_PX_THRESH 320      /* 0x140: per-pixel delta for "changed" */
 #define MAFP_DETECT_RAW_LIMIT 178559   /* 0x2B97F: count*100 must exceed this */
 #define MAFP_STABLE_SAD_LIMIT 114687   /* 0x1C1FF: sum-of-abs-diffs for "stable" */
 
 /* Enrollment */
 #define MAFP_ENROLL_STAGES    8
-
-/* ─── Scale-space keypoint matching constants (from community binary) ── */
 
 /* Gaussian pyramid: 5 levels (original + 4 blurs), 4 DoG layers */
 #define MAFP_PYR_LEVELS       5
@@ -77,7 +79,7 @@
 #define MAFP_TPL_MAGIC        0xEF
 #define MAFP_TPL_SAMPLE_SZ    (4 + MAFP_NUM_BANKS * MAFP_BANK_SZ) /* 2012 */
 
-/* Match scoring (thresholds from community binary disassembly) */
+/* Match scoring */
 #define MAFP_MATCH_THRESH     3000   /* 0xBB8: score >= this = match */
 #define MAFP_MIN_MATCH_PTS    6      /* raised from binary's 4: our simplified scoring
                                       * lacks the 9-feature sigmoid that rejects
@@ -97,8 +99,6 @@
 #define MAFP_CALIB_PATH       "/var/lib/fprint/mafp_calibration"
 #define MAFP_CALIB_SZ         0x2E50   /* 11856 bytes */
 #define MAFP_CALIB_MAGIC      0x24
-
-/* ─── device struct ──────────────────────────────────────────────── */
 
 struct _FpiDeviceMafp8800
 {
@@ -138,13 +138,8 @@ struct _FpiDeviceMafp8800
 G_DECLARE_FINAL_TYPE (FpiDeviceMafp8800, fpi_device_mafp8800, FPI, DEVICE_MAFP8800, FpDevice)
 G_DEFINE_TYPE (FpiDeviceMafp8800, fpi_device_mafp8800, FP_TYPE_DEVICE)
 
-/* ─── SPI transport ──────────────────────────────────────────────── */
+/* SPI transport */
 
-/*
- * Register read/write: 4-byte full-duplex SPI.
- * TX: [reg, val, 0x00, 0x00]
- * Response byte: rx[2] (verified against community driver)
- */
 static gint
 mafp_set_reg (FpiDeviceMafp8800 *self, guint8 reg, guint8 val)
 {
@@ -170,17 +165,21 @@ mafp_spi_xfer (FpiDeviceMafp8800 *self, guint8 *buf, gsize len)
   return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &tr) >= 0;
 }
 
-/* SPI read: send first 2 bytes of buf, receive len bytes back.
- * Matches community mafp_sensor_spi_read_data semantics. */
 static gboolean
 mafp_spi_read_data (FpiDeviceMafp8800 *self, guint8 *buf, gsize len)
 {
-  /* The community driver does write(fd, buf, 2) then read(fd, spi_buf, len).
-   * With direct ioctl, we do a single full-duplex transfer of the full length. */
   return mafp_spi_xfer (self, buf, len);
 }
 
-/* ─── FP36 chip protocol ─────────────────────────────────────────── */
+/* FP36 chip protocol */
+
+static void
+mafp_fp36_flush (FpiDeviceMafp8800 *self)
+{
+  guint8 buf[0x26] = {0};
+  buf[0] = 0x78;
+  mafp_spi_read_data (self, buf, sizeof (buf));
+}
 
 static gboolean
 mafp_fp36_reset (FpiDeviceMafp8800 *self)
@@ -207,11 +206,7 @@ mafp_fp36_capture_mode (FpiDeviceMafp8800 *self, guint8 gain, guint8 integration
   mafp_set_reg (self, 0x3C, integration);
   mafp_set_reg (self, 0x44, dac);
 
-  /* Flush/sync: read 0x26 bytes with cmd 0x78 */
-  guint8 flush[0x26];
-  memset (flush, 0x00, sizeof (flush));
-  flush[0] = 0x78;
-  mafp_spi_read_data (self, flush, 0x26);
+  mafp_fp36_flush (self);
 }
 
 static int
@@ -266,7 +261,6 @@ mafp_fp36_capture (FpiDeviceMafp8800 *self, guint8 *frame)
   return mafp_fp36_read_image (self, frame);
 }
 
-/* Read a u16 pixel from a frame buffer (row-major, LE) */
 static inline guint16
 frame_pixel (const guint8 *frame, int row, int col)
 {
@@ -274,17 +268,13 @@ frame_pixel (const guint8 *frame, int row, int col)
   return (guint16) frame[off] | ((guint16) frame[off + 1] << 8);
 }
 
-/* ─── detection mode setup ───────────────────────────────────────── */
+/* Detection mode setup */
 
 static void
 mafp_fp36_int_ctl_init (FpiDeviceMafp8800 *self)
 {
   mafp_set_reg (self, 0x10, 0xBF);
-  guint8 flush[0x26];
-  memset (flush, 0x00, sizeof (flush));
-  flush[0] = 0x78;
-  mafp_spi_read_data (self, flush, 0x26);
-
+  mafp_fp36_flush (self);
   mafp_set_reg (self, 0x20, 0x80);
   mafp_set_reg (self, 0x28, 0x00);
   mafp_set_reg (self, 0x38, 0x02);
@@ -325,12 +315,7 @@ mafp_fp36_detect_mode (FpiDeviceMafp8800 *self)
 {
   mafp_fp36_reset (self);
   mafp_set_reg (self, 0x10, 0xBF);
-
-  guint8 flush[0x26];
-  memset (flush, 0x00, sizeof (flush));
-  flush[0] = 0x78;
-  mafp_spi_read_data (self, flush, 0x26);
-
+  mafp_fp36_flush (self);
   mafp_set_reg (self, 0x20, 0x80);
   mafp_set_reg (self, 0x28, 0x00);
   mafp_set_reg (self, 0x38, 0x06);   /* detect scan mode, NOT 0x02 */
@@ -347,7 +332,7 @@ mafp_fp36_detect_mode (FpiDeviceMafp8800 *self)
   mafp_set_reg (self, 0x84, 0x00);
 }
 
-/* ─── calibration ────────────────────────────────────────────────── */
+/* Calibration */
 
 static guint8
 mafp_crc8 (const guint8 *data, gsize len)
@@ -388,31 +373,26 @@ mafp_save_calib (FpiDeviceMafp8800 *self)
       fwrite (self->calib, 1, MAFP_CALIB_SZ, f);
       fsync (fileno (f));
       fclose (f);
-      fp_info ("calibration saved to %s", MAFP_CALIB_PATH);
+      fp_dbg ("calibration saved to %s", MAFP_CALIB_PATH);
     }
 }
 
 static void
 mafp_fp36_calibrate (FpiDeviceMafp8800 *self)
 {
-  /* Try loading cached calibration */
   if (mafp_load_calib (self))
     {
-      fp_info ("loaded cached calibration (gain=%d, detect_int=%d, thresh=%d/%d/%d)",
+      fp_dbg ("loaded cached calibration (gain=%d, detect_int=%d, thresh=%d/%d/%d)",
                self->calib[1], self->calib[2],
                self->calib[4], self->calib[5], self->calib[6]);
-      /* Restore background image from calibration data */
       memcpy (self->bg_frame, self->calib + 8,
               MIN ((gsize)(MAFP_CALIB_SZ - 8), (gsize) MAFP_FRAME_BYTES));
       return;
     }
 
-  fp_info ("running live calibration...");
+  fp_dbg ("running live calibration...");
 
-  /* Binary search for optimal capture gain.
-   * Community driver reads 0x400 bytes, sums BE u16 pixel pairs.
-   * Target: total pixel sum just below 0x4007F (262,271).
-   * This means average pixel ~ 512 across ~512 bytes of pixel data. */
+  /* Binary search for optimal capture gain (target pixel sum ~0x4007F) */
   int low = 0, high = 255, mid = 128;
 
   for (int iter = 0; iter < 8; iter++)
@@ -421,20 +401,14 @@ mafp_fp36_calibrate (FpiDeviceMafp8800 *self)
       mafp_fp36_reset (self);
       mafp_fp36_capture_mode (self, (guint8) mid, 0x4C, 0x54);
 
-      /* Read exactly 0x400 bytes (matches community driver) */
       guint8 raw[0x400];
       memset (raw, 0xFF, 0x400);
       raw[0] = 0x70;
       mafp_spi_read_data (self, raw, 0x400);
 
-      /* Community driver: parses rows from 0x400 raw bytes, packs them
-       * to start of buffer, then sums exactly 0x250 bytes (296 BE u16
-       * values = 4 rows × 37 pixels) regardless of rows found.
-       * Target 0x4007F across those 148 u16 values → avg ~1772/pixel. */
       long total = 0;
       int nrows = 0;
       int i = 0;
-      /* Parse rows and pack to start of buffer (same as community) */
       while (i < 0x400 - 4 && nrows < 8)
         {
           if (raw[i] == 0x00 && raw[i+1] == 0x00 &&
@@ -450,7 +424,6 @@ mafp_fp36_calibrate (FpiDeviceMafp8800 *self)
           else
             i++;
         }
-      /* Sum exactly 0x250 bytes (148 u16 values) from packed data */
       for (int j = 0; j < 0x250; j += 2)
         total += ((guint16) raw[j] << 8) | raw[j + 1];
 
@@ -463,45 +436,33 @@ mafp_fp36_calibrate (FpiDeviceMafp8800 *self)
     }
 
   self->calib[1] = (guint8) mid;
-  fp_info ("calibration: gain=%d", mid);
+  fp_dbg ("calibration: gain=%d", mid);
 
   /* Capture background image with found gain */
   mafp_fp36_capture (self, self->bg_frame);
   memcpy (self->calib + 8, self->bg_frame,
           MIN ((gsize)(MAFP_CALIB_SZ - 8), (gsize) MAFP_FRAME_BYTES));
 
-  /* 3-pass threshold search for detection */
+  /* 3-pass threshold search: coarse (step 16), fine (step 4), finest (step 1) */
   guint8 g0, g1, g2;
   guint8 final_int = 0;
+  static const struct { int start_off; int end_off; int step; int back; } passes[] = {
+    { 0, 256, 16, 15 }, { 0, 16, 4, 0 }, { -3, 1, 1, 0 }
+  };
 
-  /* Coarse: step 16 */
-  for (int v = 0; v < 256; v += 16)
+  for (int p = 0; p < 3; p++)
     {
-      mafp_fp36_reset (self);
-      mafp_fp36_int_ctl_init (self);
-      mafp_fp36_calc_grey (self, (guint8) v, &g0, &g1, &g2);
-      if (g0 > 100 && g1 > 100 && g2 > 100)
-        { final_int = (guint8)(v > 15 ? v - 15 : 0); break; }
-    }
-
-  /* Fine: step 4 */
-  for (int v = final_int; v < final_int + 16; v += 4)
-    {
-      mafp_fp36_reset (self);
-      mafp_fp36_int_ctl_init (self);
-      mafp_fp36_calc_grey (self, (guint8) v, &g0, &g1, &g2);
-      if (g0 > 100 && g1 > 100 && g2 > 100)
-        { final_int = (guint8) v; break; }
-    }
-
-  /* Finest: step 1 */
-  for (int v = (final_int > 3 ? final_int - 3 : 0); v <= final_int; v++)
-    {
-      mafp_fp36_reset (self);
-      mafp_fp36_int_ctl_init (self);
-      mafp_fp36_calc_grey (self, (guint8) v, &g0, &g1, &g2);
-      if (g0 > 100 && g1 > 100 && g2 > 100)
-        { final_int = (guint8) v; break; }
+      int lo = (p == 0) ? passes[p].start_off : final_int + passes[p].start_off;
+      int hi = (p == 0) ? passes[p].end_off : final_int + passes[p].end_off;
+      if (lo < 0) lo = 0;
+      for (int v = lo; v < hi; v += passes[p].step)
+        {
+          mafp_fp36_reset (self);
+          mafp_fp36_int_ctl_init (self);
+          mafp_fp36_calc_grey (self, (guint8) v, &g0, &g1, &g2);
+          if (g0 > 100 && g1 > 100 && g2 > 100)
+            { final_int = (guint8)(v > passes[p].back ? v - passes[p].back : 0); break; }
+        }
     }
 
   self->calib[2] = final_int > 0 ? final_int - 1 : 0;
@@ -510,13 +471,13 @@ mafp_fp36_calibrate (FpiDeviceMafp8800 *self)
   self->calib[5] = g1 > 20 ? g1 - 20 : 0;
   self->calib[6] = g2 > 20 ? g2 - 20 : 0;
 
-  fp_info ("calibration: detect_int=%d thresh=%d/%d/%d",
+  fp_dbg ("calibration: detect_int=%d thresh=%d/%d/%d",
            self->calib[2], self->calib[4], self->calib[5], self->calib[6]);
 
   mafp_save_calib (self);
 }
 
-/* ─── finger detection (exact community algorithm) ───────────────── */
+/* Finger detection */
 
 static gboolean
 mafp_fp36_finger_is_detect (FpiDeviceMafp8800 *self)
@@ -524,8 +485,7 @@ mafp_fp36_finger_is_detect (FpiDeviceMafp8800 *self)
   /* Capture frame */
   mafp_fp36_capture (self, self->cur_frame);
 
-  /* Count pixels where background is darker than current by > MAFP_DETECT_PX_THRESH.
-   * Community checks (bg - cur) > threshold, i.e. finger DARKENS the sensor. */
+  /* Count pixels where finger darkens sensor beyond threshold */
   int changed = 0;
   for (int row = 0; row < MAFP_ROWS; row++)
     for (int col = 1; col < MAFP_COLS; col++)  /* skip column 0 */
@@ -539,9 +499,7 @@ mafp_fp36_finger_is_detect (FpiDeviceMafp8800 *self)
   gint32 raw_score = changed * 100;
   gboolean detected = raw_score > MAFP_DETECT_RAW_LIMIT;
 
-  /* Compute percentage for hysteresis */
-  gint32 pct = (MAFP_ENHANCED_PIXELS > 0)
-    ? (changed * 100) / MAFP_ENHANCED_PIXELS : 0;
+  gint32 pct = changed * 100 / MAFP_ENHANCED_PIXELS;
 
   if (!detected)
     {
@@ -549,17 +507,14 @@ mafp_fp36_finger_is_detect (FpiDeviceMafp8800 *self)
       return FALSE;
     }
 
-  /* Hysteresis */
   if (!self->detect_flag)
     {
-      /* First detection: clear reference, init score */
       memset (self->detect_ref, 0, MAFP_FRAME_BYTES);
       self->gray_value = 0;
     }
 
   if (self->gray_value < pct)
     {
-      /* Finger pressing harder: update reference to track peak */
       memcpy (self->detect_ref, self->cur_frame, MAFP_FRAME_BYTES);
       self->gray_value = pct;
     }
@@ -584,14 +539,7 @@ mafp_fp36_finger_is_stable (FpiDeviceMafp8800 *self)
   return sad <= MAFP_STABLE_SAD_LIMIT;
 }
 
-/* ─── image enhancement ──────────────────────────────────────────── */
-
-/*
- * Enhancement: bg_frame + 10000 - cur_frame
- * bg_frame = no-finger background (from calibration, stable across sessions)
- * cur_frame = current finger-present capture
- * Finger darkens pixels, so bg > cur → positive result = ridge depth.
- */
+/* Image enhancement: background subtraction + normalization */
 static void
 mafp_fp36_enhance (FpiDeviceMafp8800 *self)
 {
@@ -630,15 +578,11 @@ mafp_fp36_enhance (FpiDeviceMafp8800 *self)
     }
 }
 
-/* ─── Scale-space keypoint matching ──────────────────────────────── */
-
-/* Gaussian kernels (u16 fixed-point, sum≈65536) from community binary */
+/* Scale-space keypoint matching */
 static const guint16 kern7[]  = {291, 3539, 15862, 26152, 15862, 3539, 291};
 static const guint16 kern9[]  = {339, 1951, 6809, 14415, 18508, 14415, 6809, 1951, 339};
 static const guint16 kern13[] = {145, 575, 1771, 4248, 7937, 11549, 13086, 11549, 7937, 4248, 1771, 575, 145};
 static const guint16 kern17[] = {170, 433, 977, 1942, 3409, 5280, 7217, 8706, 9268, 8706, 7217, 5280, 3409, 1942, 977, 433, 170};
-
-/* ── Gradient computation for SIFT-WHT descriptor ── */
 
 static void
 mafp_compute_gradients (const guint16 *img, int rows, int cols,
@@ -660,7 +604,7 @@ mafp_compute_gradients (const guint16 *img, int rows, int cols,
       }
 }
 
-/* Internal keypoint representation (not serialized) */
+/* Internal keypoint representation */
 typedef struct {
   guint8  row;
   guint8  col;
@@ -671,13 +615,13 @@ typedef struct {
   guint8  desc[MAFP_DESC_BYTES];
 } MafpKeypoint;
 
-/* Correspondence for geometric verification */
+/* Correspondence for RANSAC geometric verification */
 typedef struct {
   guint8  pr, pc, gr, gc;
   guint16 p_ori, g_ori;   /* keypoint orientations for angular consistency */
 } MafpCorr;
 
-/* ── Gaussian blur (separable, fixed-point u16) ── */
+/* Gaussian blur (separable, u16 fixed-point) */
 
 static void
 mafp_blur_h (const guint16 *src, guint16 *dst,
@@ -725,7 +669,7 @@ mafp_gauss_blur (const guint16 *src, guint16 *dst, guint16 *tmp,
   mafp_blur_v (tmp, dst, kern, ksize, rows, cols);
 }
 
-/* ── DoG keypoint detection ── */
+/* DoG keypoint detection */
 
 static int
 mafp_detect_keypoints (gint16 **dog, MafpKeypoint *kps)
@@ -780,7 +724,7 @@ mafp_detect_keypoints (gint16 **dog, MafpKeypoint *kps)
   return count;
 }
 
-/* ── Orientation assignment (36-bin histogram, [0.25,0.5,0.25] smoothing) ── */
+/* Orientation assignment */
 
 static void
 mafp_assign_orientations (guint16 **pyr, MafpKeypoint *kps, int count)
@@ -853,13 +797,7 @@ mafp_assign_orientations (guint16 **pyr, MafpKeypoint *kps, int count)
     }
 }
 
-/* ── SIFT-WHT descriptor (from community binary RE) ──
- *
- * Phase 1: Build 4×4 spatial × 8 orientation gradient histogram (128 bins)
- *          from a 17×17 sample grid rotated by keypoint orientation.
- * Phase 2: Bits 0-63  = sign of 64-point Walsh-Hadamard Transform
- *          Bits 64-127 = median threshold of odd-orientation bins
- */
+/* SIFT-WHT binary descriptor: 17x17 rotated gradient grid -> 128-bit output */
 
 static void
 mafp_compute_descriptor (const gint32 *grad_mag, const guint16 *grad_ori,
@@ -976,7 +914,7 @@ mafp_compute_descriptor (const gint32 *grad_mag, const guint16 *grad_ori,
       desc[8 + i / 8] |= (guint8) (1 << (i % 8));
 }
 
-/* ── Feature extraction: enhanced u16 image → 2012-byte template ── */
+/* Feature extraction: enhanced image -> 2012-byte template */
 
 static int
 mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
@@ -1065,11 +1003,11 @@ mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
   gint32 b0, b1;
   memcpy (&b0, tpl + 4, 4);
   memcpy (&b1, tpl + 4 + MAFP_BANK_SZ, 4);
-  fp_info ("extract: %d keypoints (%d + %d)", b0 + b1, b0, b1);
+  fp_dbg ("extract: %d keypoints (%d + %d)", b0 + b1, b0, b1);
   return b0 + b1;
 }
 
-/* ── Hamming distance between two 128-bit descriptors ── */
+/* Template matching */
 
 static inline int
 mafp_hamming (const guint8 *a, const guint8 *b)
@@ -1079,8 +1017,6 @@ mafp_hamming (const guint8 *a, const guint8 *b)
   return __builtin_popcountll (a64[0] ^ b64[0])
        + __builtin_popcountll (a64[1] ^ b64[1]);
 }
-
-/* ── Geometric verification ── */
 
 static gboolean
 mafp_solve_similarity (const MafpCorr *c,
@@ -1131,17 +1067,6 @@ mafp_count_inliers (const MafpCorr *corrs, int n,
   return count;
 }
 
-/* ── Scoring (from community binary disassembly) ── */
-
-/*
- * Binary's scoring: 8+ inliers = auto-match (score 10000).
- * <3 inliers = no match (score 0).
- * 3-7 inliers: score proportional to count. The binary uses a
- * 9-feature weighted sigmoid where inlier_count is the dominant
- * feature (weight 188145, bias 711041). 4 inliers alone exceeds
- * the bias, so 4+ nearly always matches. We approximate:
- *   score = inlier_count * 1250 (3→3750, 4→5000, ..., 8→10000)
- */
 static int
 mafp_compute_match_score (int n_inliers)
 {
@@ -1151,8 +1076,6 @@ mafp_compute_match_score (int n_inliers)
     return 10000;
   return MIN (n_inliers * 1250, 10000);
 }
-
-/* ── Top-level template matching ── */
 
 static int
 mafp_match_templates (const guint8 *probe, const guint8 *gallery)
@@ -1186,7 +1109,7 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
                 second = d;
             }
 
-          /* Ratio test: best*256 < second*219 (≈0.855, from binary) */
+          /* Ratio test */
           if (best_gi >= 0 && best < MAFP_HAMMING_THRESH &&
               (second >= 999 || best * 256 < second * MAFP_HAMMING_RATIO))
             {
@@ -1207,10 +1130,8 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
         }
     }
 
-  /* Deduplicate: keep only the best match per gallery keypoint
-   * (the binary's uniquePoints function does this) */
+  /* Deduplicate: keep only the best match per gallery keypoint */
   {
-    gboolean used_g[60] = {0};
     int deduped = 0;
     for (int i = 0; i < n_corrs; i++)
       {
@@ -1229,22 +1150,19 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
   if (n_corrs < MAFP_MIN_MATCH_PTS)
     return 0;
 
-  /* Exhaustive pairwise RANSAC (matching binary's approach) */
+  /* Exhaustive pairwise RANSAC */
   int best_inliers = 0;
   gdouble best_avg_dist = 1e9;
 
   for (int i = 0; i < n_corrs - 1; i++)
     for (int j = i + 1; j < n_corrs; j++)
       {
-        /* Angular consistency check (from binary at 0x2069c-0x20735):
-         * The rotation implied by both correspondences must agree
-         * within ~10°. Without this, the narrow sensor geometry
-         * lets spurious pairs produce valid-looking transforms. */
+        /* Angular consistency: both correspondences must agree on rotation */
         guint16 dp = corrs[i].p_ori - corrs[j].p_ori;
         guint16 dg = corrs[i].g_ori - corrs[j].g_ori;
         gint16  adiff = (gint16) (dp - dg);
         if (adiff < 0) adiff = -adiff;
-        if (adiff > 1822)  /* ~10° = 1822/65536 * 360° */
+        if (adiff > 1822)  /* ~10 degrees */
           continue;
 
         MafpCorr pair[2] = { corrs[i], corrs[j] };
@@ -1252,7 +1170,7 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
         if (!mafp_solve_similarity (pair, &a, &b, &tx, &ty))
           continue;
 
-        /* Count inliers with pixel-space threshold (~3 px distance) */
+        /* Count inliers */
         gdouble avg_d = 0;
         MafpCorr inliers_buf[MAFP_MAX_INLIERS];
         int inl = mafp_count_inliers (corrs, n_corrs, a, b, tx, ty,
@@ -1263,7 +1181,7 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
 
         if (inl >= MAFP_MIN_MATCH_PTS)
           {
-            /* Refit transform from inliers only (matching binary) */
+            /* Refit transform from inliers */
             if (inl >= 2)
               {
                 MafpCorr rpair[2] = { inliers_buf[0], inliers_buf[1] };
@@ -1287,12 +1205,10 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
 
 done:;
   int score = mafp_compute_match_score (best_inliers);
-  fp_info ("match: inliers=%d avg_dist=%.1f score=%d (thresh=%d)",
+  fp_dbg ("match: inliers=%d avg_dist=%.1f score=%d (thresh=%d)",
            best_inliers, best_avg_dist, score, MAFP_MATCH_THRESH);
   return score;
 }
-
-/* ─── check cancellation ─────────────────────────────────────────── */
 
 static gboolean
 mafp_is_canceled (FpiDeviceMafp8800 *self)
@@ -1300,12 +1216,12 @@ mafp_is_canceled (FpiDeviceMafp8800 *self)
   return self->canceled || fpi_device_action_is_cancelled (FP_DEVICE (self));
 }
 
-/* ─── enroll (runs in worker thread) ─────────────────────────────── */
+/* Enroll/verify (worker thread) */
 
 static void
 mafp_enroll_run (FpiDeviceMafp8800 *self)
 {
-  fp_info ("enroll: starting");
+  fp_dbg ("enroll: starting");
 
   /* Calibrate (loads from file or runs live) */
   mafp_fp36_calibrate (self);
@@ -1322,7 +1238,7 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
       if (mafp_is_canceled (self))
         goto canceled;
 
-      fp_info ("enroll: stage %d/%d — waiting for finger", stage + 1, MAFP_ENROLL_STAGES);
+      fp_dbg ("enroll: stage %d/%d", stage + 1, MAFP_ENROLL_STAGES);
 
       /* Reset detection state */
       self->detect_flag = FALSE;
@@ -1337,8 +1253,6 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
         }
       if (mafp_is_canceled (self))
         goto canceled;
-
-      fp_info ("enroll: finger detected, waiting for stable");
 
       /* Wait for stable */
       memcpy (self->stab_frame, self->cur_frame, MAFP_FRAME_BYTES);
@@ -1356,24 +1270,20 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
 
       if (!stable)
         {
-          fp_info ("enroll: not stable, retrying stage");
+          fp_dbg ("enroll: not stable, retrying stage %d", stage + 1);
           fpi_device_enroll_progress (FP_DEVICE (self), stage, NULL,
             fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
           stage--;
           continue;
         }
 
-      fp_info ("enroll: stable, capturing template");
-
-      /* Enhance image and extract keypoint features */
+      /* Enhance and extract */
       mafp_fp36_enhance (self);
       mafp_extract_features (self->enhanced,
                              tpl_buf + MAFP_TPL_HDR_SZ + tpl_count * MAFP_TPL_SAMPLE_SZ);
       tpl_count++;
 
       fpi_device_enroll_progress (FP_DEVICE (self), stage, NULL, NULL);
-
-      fp_info ("enroll: stage %d done, waiting for finger removal", stage + 1);
 
       /* Wait for finger removal */
       while (!mafp_is_canceled (self))
@@ -1389,7 +1299,6 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
   if (mafp_is_canceled (self))
     goto canceled;
 
-  /* Store template count and serialize */
   memcpy (tpl_buf, &tpl_count, sizeof (gint32));
 
   FpPrint *print = NULL;
@@ -1400,24 +1309,22 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
   fpi_print_set_device_stored (print, FALSE);
   g_object_set (print, "fpi-data", data, NULL);
 
-  fp_info ("enroll: complete, %d templates", tpl_count);
+  fp_dbg ("enroll: complete, %d templates", tpl_count);
   fpi_device_enroll_complete (FP_DEVICE (self), g_object_ref (print), NULL);
   return;
 
 canceled:
-  fp_info ("enroll: canceled");
+  fp_dbg ("enroll: canceled");
   fpi_device_enroll_complete (FP_DEVICE (self), NULL,
     fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
 }
-
-/* ─── verify/identify (runs in worker thread) ────────────────────── */
 
 static void
 mafp_verify_run (FpiDeviceMafp8800 *self)
 {
   FpiDeviceAction action = fpi_device_get_current_action (FP_DEVICE (self));
 
-  fp_info ("verify/identify: starting");
+  fp_dbg ("verify/identify: starting");
 
   mafp_fp36_calibrate (self);
   mafp_fp36_detect_mode (self);
@@ -1474,7 +1381,7 @@ mafp_verify_run (FpiDeviceMafp8800 *self)
                 {
                   const guint8 *sample = tpl + MAFP_TPL_HDR_SZ + i * MAFP_TPL_SAMPLE_SZ;
                   int score = mafp_match_templates (probe_tpl, sample);
-                  fp_info ("verify: template %d score=%d (thresh=%d)",
+                  fp_dbg ("verify: template %d score=%d (thresh=%d)",
                            i, score, MAFP_MATCH_THRESH);
                   if (score >= MAFP_MATCH_THRESH)
                     { matched = TRUE; break; }
@@ -1534,7 +1441,7 @@ canceled:
     }
 }
 
-/* ─── worker thread ──────────────────────────────────────────────── */
+/* Worker thread */
 
 static gpointer
 mafp_worker (gpointer data)
@@ -1572,7 +1479,7 @@ mafp_dispatch (FpiDeviceMafp8800 *self, void (*func)(FpiDeviceMafp8800 *))
   g_mutex_unlock (&self->lock);
 }
 
-/* ─── FpDevice callbacks ─────────────────────────────────────────── */
+/* FpDevice callbacks */
 
 static void
 mafp_open (FpDevice *dev)
@@ -1684,7 +1591,7 @@ mafp_cancel (FpDevice *dev)
   g_mutex_unlock (&self->lock);
 }
 
-/* ─── GObject ────────────────────────────────────────────────────── */
+/* GObject boilerplate */
 
 static const FpIdEntry mafp_id_table[] = {
   { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV,
@@ -1698,13 +1605,9 @@ static void
 fpi_device_mafp8800_finalize (GObject *obj)
 {
   FpiDeviceMafp8800 *self = FPI_DEVICE_MAFP8800 (obj);
-  g_clear_pointer (&self->bg_frame, g_free);
-  g_clear_pointer (&self->cur_frame, g_free);
-  g_clear_pointer (&self->stab_frame, g_free);
-  g_clear_pointer (&self->detect_ref, g_free);
-  g_clear_pointer (&self->enhanced, g_free);
-  g_clear_pointer (&self->spi_buf, g_free);
-  if (self->spi_fd >= 0) close (self->spi_fd);
+
+  if (self->spi_fd >= 0)
+    close (self->spi_fd);
   G_OBJECT_CLASS (fpi_device_mafp8800_parent_class)->finalize (obj);
 }
 

@@ -25,9 +25,8 @@ This project provides a **fully open-source replacement** where every line of co
 | Image capture (160x37 px, 16-bit) | Working |
 | Image enhancement | Working |
 | Enrollment (8 stages via fprintd) | Working |
-| Fingerprint matching (SIFT-WHT descriptors) | Working (100% true-accept, 0% false-accept) |
+| Fingerprint matching (SIFT-WHT descriptors) | Working |
 | PAM integration (sudo, login) | Working |
-| FP88 variant (chip ID 0x58) | Detected, not yet supported |
 | Upstream submission to libfprint | Not yet started |
 
 ## Supported hardware
@@ -35,7 +34,8 @@ This project provides a **fully open-source replacement** where every line of co
 | Device | Sensor | Chip ID | Interface | Status |
 |--------|--------|---------|-----------|--------|
 | GPD MicroPC 2 | Microarray MAFP8800 (FP36) | 0x24 | SPI (ACPI HID `MAFP8800`) | Working |
-| Other MAFP8800 devices | Microarray MAFP8800 (FP88) | 0x58 | SPI | Detected, not supported |
+
+The community binary also supports a second variant (FP88, chip ID 0x58) with separate `mafp_sensor88_*` functions, suggesting a different image geometry. This driver only supports the FP36 variant. If you have hardware with chip ID 0x58, please open an issue.
 
 ## Building and installing
 
@@ -116,7 +116,7 @@ The sensor uses a register-level SPI protocol (match-on-host mode). All communic
 | Register | Purpose | Values |
 |----------|---------|--------|
 | 0x00 | Status | Read: 0x41 = ready |
-| 0x04 | Chip ID | 0x24 = FP36, 0x58 = FP88 |
+| 0x04 | Chip ID | 0x24 = FP36 |
 | 0x0E | Manufacturer | 0x4D = 'M' (Microarray) |
 | 0x8C | Reset trigger | Write 0xFF to reset |
 | 0x88 | Capture mode | Write 0xFF to enter |
@@ -248,7 +248,7 @@ This driver was built through multi-session reverse engineering of the Windows `
 4. **Image enhancement** -- implemented background subtraction and normalization matching the community binary
 5. **NCC matching** -- initial matching via normalized cross-correlation (worked but had a 67% false-accept rate)
 6. **Scale-space keypoints** -- replaced NCC with DoG keypoint detection, SIFT-WHT descriptors, and geometric verification (right structure, but true-accept rate was only 33%)
-7. **Descriptor stability** -- four targeted fixes from binary disassembly (DoG minima detection, spatial bin width 8->5px, Gaussian sigma 8->10, gradient source) brought true-accept to 100% while maintaining 0% false-accept
+7. **Descriptor stability** -- four targeted fixes from binary disassembly (DoG minima detection, spatial bin width 8->5px, Gaussian sigma 8->10, gradient source) resolved the remaining matching reliability issues
 
 ## License
 

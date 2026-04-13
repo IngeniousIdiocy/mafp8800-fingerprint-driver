@@ -1,18 +1,23 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
 /*
- * Microarray MAFP8800 SPI Fingerprint Sensor Driver (FP36 variant)
+ * Microarray MAFP8800 driver for libfprint
+ * Copyright (C) 2026 Mark Blakeney
  *
- * Copyright (C) 2026 Mark (GPD MicroPC 2 reverse-engineering project)
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- * Protocol decoded from the community libfprint driver binary and
- * verified against working hardware. Uses FP36 register-level SPI
- * protocol (match-on-host mode).
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * Architecture: FpDevice subclass with a dedicated worker thread.
- * All SPI operations run in the worker thread. The main GLib thread
- * dispatches enroll/verify/identify requests via GCond signaling.
- *
- * For detailed documentation (protocol, matching algorithm, project history):
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/* For detailed documentation (protocol, matching algorithm, project history):
  * https://github.com/IngeniousIdiocy/mafp8800-fingerprint-driver
  */
 

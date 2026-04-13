@@ -11,6 +11,9 @@
  * Architecture: FpDevice subclass with a dedicated worker thread.
  * All SPI operations run in the worker thread. The main GLib thread
  * dispatches enroll/verify/identify requests via GCond signaling.
+ *
+ * For detailed documentation (protocol, matching algorithm, project history):
+ * https://github.com/IngeniousIdiocy/mafp8800-fingerprint-driver
  */
 
 #define FP_COMPONENT "mafp8800"
@@ -71,7 +74,9 @@
 
 /* Match scoring (thresholds from community binary disassembly) */
 #define MAFP_MATCH_THRESH     3000   /* 0xBB8: score >= this = match */
-#define MAFP_MIN_MATCH_PTS    4      /* binary: 3 inliers scores below bias, need 4+ */
+#define MAFP_MIN_MATCH_PTS    6      /* raised from binary's 4: our simplified scoring
+                                      * lacks the 9-feature sigmoid that rejects
+                                      * low-quality 4-5 inlier matches */
 #define MAFP_HAMMING_THRESH   48     /* max Hamming distance for descriptor match */
 #define MAFP_HAMMING_RATIO    219    /* ratio test: best*256 < second*219 (≈0.855) */
 #define MAFP_INLIER_DIST_SQ   9.0   /* 2303/256: binary uses Q8, we use pixel coords */
@@ -663,7 +668,8 @@ typedef struct {
 
 /* Correspondence for geometric verification */
 typedef struct {
-  guint8 pr, pc, gr, gc;
+  guint8  pr, pc, gr, gc;
+  guint16 p_ori, g_ori;   /* keypoint orientations for angular consistency */
 } MafpCorr;
 
 /* ── Gaussian blur (separable, fixed-point u16) ── */
@@ -1186,8 +1192,10 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
                       best, second);
               corrs[n_corrs].pr = pd[16];
               corrs[n_corrs].pc = pd[17];
+              memcpy (&corrs[n_corrs].p_ori, pd + 18, 2);
               corrs[n_corrs].gr = gk[best_gi * MAFP_KP_SIZE + 16];
               corrs[n_corrs].gc = gk[best_gi * MAFP_KP_SIZE + 17];
+              memcpy (&corrs[n_corrs].g_ori, gk + best_gi * MAFP_KP_SIZE + 18, 2);
               n_corrs++;
               bank_matches++;
             }
@@ -1223,6 +1231,17 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
   for (int i = 0; i < n_corrs - 1; i++)
     for (int j = i + 1; j < n_corrs; j++)
       {
+        /* Angular consistency check (from binary at 0x2069c-0x20735):
+         * The rotation implied by both correspondences must agree
+         * within ~10°. Without this, the narrow sensor geometry
+         * lets spurious pairs produce valid-looking transforms. */
+        guint16 dp = corrs[i].p_ori - corrs[j].p_ori;
+        guint16 dg = corrs[i].g_ori - corrs[j].g_ori;
+        gint16  adiff = (gint16) (dp - dg);
+        if (adiff < 0) adiff = -adiff;
+        if (adiff > 1822)  /* ~10° = 1822/65536 * 360° */
+          continue;
+
         MafpCorr pair[2] = { corrs[i], corrs[j] };
         gdouble a, b, tx, ty;
         if (!mafp_solve_similarity (pair, &a, &b, &tx, &ty))
